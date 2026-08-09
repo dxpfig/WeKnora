@@ -26,10 +26,18 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 检查是否存在本地protoc安装包，如果存在则离线安装，否则在线安装
+# 检查是否存在本地protoc安装包 — 优先用 ./packages/ 里的 zip,
+# 否则(可被 build-arg PROTOC_ALLOW_ONLINE=false 关闭)在 GitHub 可达时在线下载。
+# 注意:build context 的 packages/ 至少要有 .gitkeep,否则下面的 COPY 会失败。
+# 预下载:在能上 github.com 的机器上跑
+#   curl -L -o packages/protoc-3.19.4-linux-x86_64.zip \
+#     https://github.com/protocolbuffers/protobuf/releases/download/v3.19.4/protoc-3.19.4-linux-x86_64.zip
+# 然后把整个 source/packages/ 同步到 NAS。
 ARG TARGETARCH
+ARG PROTOC_ALLOW_ONLINE="true"
+# 把 packages/ 整个目录搬进 container — 包含 .gitkeep 哨兵 + 任何预下载的产物(protoc zip 等)
+# 注意:packages/ 必须至少含 .gitkeep,否则下面这行 COPY 会因"目录无文件"而失败。
 COPY packages/ /app/packages/
-RUN ls -lah /app/packages/
 # 兼容 BuildKit 和传统构建：如果 TARGETARCH 为空，使用 uname 检测
 RUN if [ -z "$TARGETARCH" ]; then \
         case $(uname -m) in \
@@ -50,17 +58,21 @@ RUN if [ -z "$TARGETARCH" ]; then \
     esac && \
     PROTOC_PACKAGE="protoc-3.19.4-linux-${PROTOC_ARCH}.zip" && \
     if [ -f "/app/packages/${PROTOC_PACKAGE}" ]; then \
-        echo "发现本地protoc安装包，将进行离线安装"; \
-        cp /app/packages/${PROTOC_PACKAGE} /app/ && \
-        unzip -o /app/${PROTOC_PACKAGE} -d /usr/local && \
+        echo "[protoc] 使用本地包 /app/packages/${PROTOC_PACKAGE}"; \
+        unzip -o /app/packages/${PROTOC_PACKAGE} -d /usr/local && \
         chmod +x /usr/local/bin/protoc && \
-        rm -f /app/${PROTOC_PACKAGE}; \
-    else \
-        echo "未发现本地protoc安装包，将进行在线安装"; \
+        rm -f /app/packages/${PROTOC_PACKAGE}; \
+    elif [ "${PROTOC_ALLOW_ONLINE}" = "true" ]; then \
+        echo "[protoc] 在线下载 ${PROTOC_PACKAGE} (PROTOC_ALLOW_ONLINE=true)"; \
         curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v3.19.4/${PROTOC_PACKAGE} && \
         unzip -o ${PROTOC_PACKAGE} -d /usr/local && \
         chmod +x /usr/local/bin/protoc && \
         rm -f ${PROTOC_PACKAGE}; \
+    else \
+        echo "ERROR: protoc zip ${PROTOC_PACKAGE} not found in source/packages/ and PROTOC_ALLOW_ONLINE!=true" >&2; \
+        echo "  解法 A: 在能上 github.com 的机器上下载 zip,放到 source/packages/${PROTOC_PACKAGE}" >&2; \
+        echo "  解法 B: --build-arg PROTOC_ALLOW_ONLINE=true(前提是 build 沙箱能上 github.com)" >&2; \
+        exit 1; \
     fi
 
 # 复制依赖文件
@@ -111,8 +123,17 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 grpc_health_probe
+# 安装 grpc_health_probe — 优先用 ./packages/ 里的二进制,
+# 否则(可被 build-arg GRPC_HEALTH_PROBE_ALLOW_ONLINE=false 关闭)在 GitHub 可达时在线下载。
+# 预下载:在能上 github.com 的机器上跑
+#   curl -L -o packages/grpc_health_probe-linux-amd64 \
+#     https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.24/grpc_health_probe-linux-amd64
+# 然后把整个 source/packages/ 同步到 NAS。
 ARG TARGETARCH
+ARG GRPC_HEALTH_PROBE_VERSION=v0.4.24
+ARG GRPC_HEALTH_PROBE_ALLOW_ONLINE="true"
+# 把 packages/ 整个目录搬进 container — 见 protoc 块注释
+COPY packages/ /app/packages/
 # 兼容 BuildKit 和传统构建：如果 TARGETARCH 为空，使用 uname 检测
 RUN if [ -z "$TARGETARCH" ]; then \
         case $(uname -m) in \
@@ -132,7 +153,19 @@ RUN if [ -z "$TARGETARCH" ]; then \
         "arm") ARCH="arm" ;; \
         *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
-    wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-${ARCH} && \
+    GRPC_HEALTH_PROBE_FILE="grpc_health_probe-linux-${ARCH}" && \
+    if [ -f "/app/packages/${GRPC_HEALTH_PROBE_FILE}" ]; then \
+        echo "[grpc_health_probe] 使用本地包 /app/packages/${GRPC_HEALTH_PROBE_FILE}"; \
+        cp /app/packages/${GRPC_HEALTH_PROBE_FILE} /bin/grpc_health_probe; \
+    elif [ "${GRPC_HEALTH_PROBE_ALLOW_ONLINE}" = "true" ]; then \
+        echo "[grpc_health_probe] 在线下载 ${GRPC_HEALTH_PROBE_FILE} (GRPC_HEALTH_PROBE_ALLOW_ONLINE=true)"; \
+        wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/${GRPC_HEALTH_PROBE_FILE}; \
+    else \
+        echo "ERROR: ${GRPC_HEALTH_PROBE_FILE} not in source/packages/ and GRPC_HEALTH_PROBE_ALLOW_ONLINE!=true" >&2; \
+        echo "  解法 A: 在能上 github.com 的机器上下载二进制,放到 source/packages/${GRPC_HEALTH_PROBE_FILE}" >&2; \
+        echo "  解法 B: --build-arg GRPC_HEALTH_PROBE_ALLOW_ONLINE=true (前提是 build 沙箱能上 github.com)" >&2; \
+        exit 1; \
+    fi && \
     chmod +x /bin/grpc_health_probe
 
 # 从构建阶段复制已安装的依赖和生成的代码

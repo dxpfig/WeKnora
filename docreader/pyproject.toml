@@ -28,3 +28,7 @@ dependencies = [
     "textract==1.5.0",
     "trafilatura>=2.0.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["docreader", "docreader.*"]
+exclude = ["testdata*", "tests*", "scripts*"]

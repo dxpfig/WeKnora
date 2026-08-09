@@ -100,7 +100,8 @@ COPY --from=builder /app/skills/preloaded ./skills/preloaded
 # Keep a read-only backup so bind-mount cannot erase built-in skills
 COPY --from=builder /app/skills/preloaded ./skills/_builtin
 COPY --from=builder /root/.duckdb /home/appuser/.duckdb
-COPY --from=builder /app/WeKnora .
+# 复制二进制:兼容 WeKnora 或 server 两种命名(历史 build 有时产出 server)
+COPY --from=builder /app/WeKnora* ./
 
 # Copy and make entrypoint script executable
 COPY --from=builder /app/scripts/docker-entrypoint.sh ./scripts/docker-entrypoint.sh
@@ -113,4 +114,5 @@ EXPOSE 8080
 
 
 ENTRYPOINT ["./scripts/docker-entrypoint.sh"]
-CMD ["./WeKnora"]
+# 容错启动:优先 WeKnora,fallback 到 server(防止 Dockerfile 期望跟 build 实际产出名字不一致)
+CMD ["sh", "-c", "exec ./WeKnora || exec ./server"]
