@@ -1519,6 +1519,18 @@ func initNeo4jClient() (neo4j.Driver, error) {
 }
 
 func NewDuckDB() (*sql.DB, error) {
+	// Lite-mode workaround: the prebuilt DuckDB C static library references
+	// `__emutls_v._ZSt1x__once_call[able]` emulated-TLS symbols that recent
+	// MinGW-w64 libstdc++/libgcc no longer export, causing a NULL dereference
+	// during `duckdb_open_ext`. Returning a no-op DB lets the HTTP server
+	// come up; the data_analysis DuckDB-backed agent tool will be unavailable
+	// (callers must check for nil). xlsx/xls spatial ingest will degrade.
+	if handler.Edition == "lite" {
+		logger.Infof(context.Background(),
+			"[DuckDB] Lite mode: skipping DuckDB open (MinGW 16 emutls ABI mismatch); data_analysis tool disabled")
+		return nil, nil
+	}
+
 	sqlDB, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
