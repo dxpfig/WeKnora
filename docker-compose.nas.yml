@@ -185,7 +185,7 @@ services:
       - DOCREADER_ODL_HYBRID=${DOCREADER_ODL_HYBRID:-off}
       - DOCREADER_ODL_HYBRID_URL=${DOCREADER_ODL_HYBRID_URL:-http://odl-hybrid:5002}
       - DOCREADER_MARKITDOWN_MAX_WORKERS=${DOCREADER_MARKITDOWN_MAX_WORKERS:-1}
-      - DOCREADER_GRPC_AUTH_TOKEN=${GRPC_AUTH_TOKEN:-}
+      - DOCREADER_GRPC_AUTH_TOKEN=${GRPC_AUTH_TOKEN:?required (must match GRPC_AUTH_TOKEN on app side)}
       - GRPC_TLS_ENABLED=${GRPC_TLS_ENABLED:-false}
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
@@ -219,7 +219,7 @@ services:
       - /volume1/docker/weknora/env-share/.env
     profiles: [neo4j]
     environment:
-      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-neo4j123}
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required (set in .env when using --profile neo4j)}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
       - NEO4J_dbms_memory_heap_initial__size=2G
@@ -252,9 +252,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${LANGFUSE_DB_NAME:-langfuse}
       - NEXTAUTH_URL=http://192.168.2.3:3000
-      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:-}
-      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:-}
-      - SALT=${LANGFUSE_SALT:-}
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:?required (set in .env when using --profile langfuse)}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:?required (set in .env when using --profile langfuse)}
+      - SALT=${LANGFUSE_SALT:?required (set in .env when using --profile langfuse)}
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/${LANGFUSE_REDIS_DB:-1}
     ports:
       - "${LANGFUSE_WEB_PORT:-3000}:3000"
@@ -297,8 +297,8 @@ services:
     profiles: [langfuse]
     command: server /data --console-address ":9101"
     environment:
-      - MINIO_ROOT_USER=${LANGFUSE_MINIO_USER:-langfuseminio}
-      - MINIO_ROOT_PASSWORD=${LANGFUSE_MINIO_PASSWORD:-langfuseminiosecret}
+      - MINIO_ROOT_USER=${LANGFUSE_MINIO_USER:?required (set in .env when using --profile langfuse)}
+      - MINIO_ROOT_PASSWORD=${LANGFUSE_MINIO_PASSWORD:?required (set in .env when using --profile langfuse)}
     volumes:
       - weknora_langfuse_minio_data:/data
     ports:
@@ -321,8 +321,8 @@ services:
     profiles: [minio]
     command: server /data --console-address ":9001"
     environment:
-      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY_ID:-minioadmin}
-      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY_ID:?required (set in .env when using --profile minio)}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY:?required (set in .env when using --profile minio)}
     volumes:
       - weknora_minio_data:/data
     ports:
