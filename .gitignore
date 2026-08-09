@@ -29,7 +29,7 @@ logs/
 *.pid
 
 WeKnora
-WeKnora-lite
+WeKnora-lite*
 cmd/desktop/build/bin/
 /models/
 test/data/mswag.txt
@@ -47,7 +47,24 @@ web/
 frontend/.vite
 frontend/chrome-extension/
 WeKnora-Chrome-Extension
-packages/protoc-3.19.4-linux-x86_64.zip
+
+# NAS 部署专用:本地 Windows 编译产物 / 打包归档
+WeKnora-lite.exe
+weknora-source.tar.gz
+
+# Python 包构建产物(docreader 是 Python 包,pip install -e . 会在此生成)
+docreader/docreader.egg-info/
+
+# 跟 WeKnora 无关的整库 clone(本地为方便调 ODL hybrid 而拉过来)
+odl-src/
+
+# 本机一次性 probe 脚本 + Windows 环境管理脚本(不属 WeKnora 仓库)
+tmp-*.py
+*.ps1
+
+# packages/ 里下载到 NAS 的二进制(protoc / grpc_health_probe,目录本身保留以便 .gitkeep 占位)
+packages/protoc-*.zip
+packages/grpc_health_probe-linux-*
 
 Claude.md
 
