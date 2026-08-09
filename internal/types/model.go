@@ -76,6 +76,15 @@ type ModelParameters struct {
 	// 保留字段（Authorization、api-key、Content-Type、Accept 等）会在运行期被忽略以避免破坏签名/鉴权流程。
 	CustomHeaders  map[string]string `yaml:"custom_headers,omitempty" json:"custom_headers,omitempty"`
 	SupportsVision bool              `yaml:"supports_vision"      json:"supports_vision"` // Whether the model accepts image/multimodal input
+	// ImageDetail controls the OpenAI `image_url.detail` value sent on every
+	// multimodal request to this model. Empty (the default) means "do not
+	// emit the field at all" — the upstream SDK uses json:"detail,omitempty",
+	// so providers fall back to their own default (typically "high" for
+	// OpenAI-compatible endpoints). Set to "low" / "high" / "auto" for the
+	// canonical values, or any other string to pass through as-is for
+	// provider-specific behavior (e.g. MiniMax M3 rejects "auto" with code
+	// 2013 — see internal/models/vlm/remote_api.go).
+	ImageDetail string `yaml:"image_detail,omitempty" json:"image_detail,omitempty"`
 	// MaxConcurrency caps concurrent in-flight BACKGROUND (ingestion /
 	// enrichment) calls to THIS specific model, keyed by model ID and shared
 	// across all replicas. 0 (the default) means "fall back to the

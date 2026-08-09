@@ -33,6 +33,10 @@ type Config struct {
 	// back to the process-wide default (see limiter.GateN).
 	MaxConcurrency int
 	Extra          map[string]any
+	// ImageDetail mirrors types.ModelParameters.ImageDetail. Read by
+	// RemoteAPIVLM and forwarded into the OpenAI `image_url.detail` field.
+	// Empty → omit the field entirely (SDK omitempty).
+	ImageDetail string
 	// CustomHeaders 允许在调用远程 API 时附加自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
 	CustomHeaders map[string]string
 	AppID         string
@@ -65,6 +69,7 @@ func ConfigFromModel(m *types.Model, appID, appSecret string) *Config {
 		Provider:       m.Parameters.Provider,
 		MaxConcurrency: m.Parameters.MaxConcurrency,
 		Extra:          stringMapToAnyMap(m.Parameters.ExtraConfig),
+		ImageDetail:    m.Parameters.ImageDetail,
 		CustomHeaders:  m.Parameters.CustomHeaders,
 		AppID:          appID,
 		AppSecret:      appSecret,

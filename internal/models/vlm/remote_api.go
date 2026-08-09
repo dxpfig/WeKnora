@@ -45,6 +45,12 @@ type RemoteAPIVLM struct {
 	client      *openai.Client
 	baseURL     string
 	temperature float32
+	// imageDetail, when non-empty, is forwarded as the OpenAI
+	// `image_url.detail` field on every image part. When empty, the field is
+	// omitted entirely (SDK `omitempty`) so providers fall back to their own
+	// default — this avoids hardcoding "auto", which some providers (e.g.
+	// MiniMax M3, code 2013) reject. See types.ModelParameters.ImageDetail.
+	imageDetail string
 }
 
 // NewRemoteAPIVLM creates a remote-API backed VLM instance.
@@ -103,6 +109,7 @@ func NewRemoteAPIVLM(config *Config) (*RemoteAPIVLM, error) {
 		client:      openai.NewClientWithConfig(apiCfg),
 		baseURL:     config.BaseURL,
 		temperature: temp,
+		imageDetail: strings.TrimSpace(config.ImageDetail),
 	}, nil
 }
 
@@ -122,12 +129,19 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 			mimeType := detectImageMIME(imgBytes)
 			b64 := base64.StdEncoding.EncodeToString(imgBytes)
 			dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, b64)
+			// Build the image_url part. We only set Detail when the model
+			// explicitly opts in via ModelParameters.ImageDetail — the SDK
+			// marks Detail `omitempty`, so an empty value means "do not
+			// emit the field" and lets the provider pick its own default.
+			// Hardcoding "auto" here broke MiniMax M3 (rejects with code
+			// 2013) and any other provider that doesn't accept that value.
+			imgURL := &openai.ChatMessageImageURL{URL: dataURI}
+			if v.imageDetail != "" {
+				imgURL.Detail = openai.ImageURLDetail(v.imageDetail)
+			}
 			parts = append(parts, openai.ChatMessagePart{
-				Type: openai.ChatMessagePartTypeImageURL,
-				ImageURL: &openai.ChatMessageImageURL{
-					URL:    dataURI,
-					Detail: openai.ImageURLDetailAuto,
-				},
+				Type:     openai.ChatMessagePartTypeImageURL,
+				ImageURL: imgURL,
 			})
 		}
 	}
