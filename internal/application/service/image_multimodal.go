@@ -19,6 +19,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
+	"github.com/Tencent/WeKnora/internal/utils/ratelimit"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
@@ -133,6 +134,134 @@ func (s *ImageMultimodalService) tracker() SpanTracker {
 	return s.spanTracker
 }
 
+// classifyVLMError maps an error from vlm.Predict to one of the
+// canonical error_class values persisted in chunks.metadata.image_statuses.
+// "rate_limit" wins over "vlm_error" so a transient burst gets the more
+// actionable label and RetryFailedImages defaults to retrying it.
+// Empty string for nil errors.
+func classifyVLMError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if ratelimit.IsLikelyRateLimitError(err) {
+		return "rate_limit"
+	}
+	return "vlm_error"
+}
+
+// computeFinalStatus derives the final ImageStatusEntry for an image
+// from the captured imgOut map. Used at the end of Handle to write a
+// single consolidated status (rather than per-OCR/per-caption writes).
+//
+// Severity order: rate_limit > vlm_error > (succeeded). The longest
+// error message wins to preserve the most diagnostic context.
+func computeFinalStatus(imgOut types.JSONMap) types.ImageStatusEntry {
+	ocrClass, _ := imgOut["ocr_error_class"].(string)
+	capClass, _ := imgOut["caption_error_class"].(string)
+	ocrMsg, _ := imgOut["ocr_error"].(string)
+	capMsg, _ := imgOut["caption_error"].(string)
+
+	var class, msg string
+	if ocrClass == "rate_limit" || capClass == "rate_limit" {
+		class = "rate_limit"
+	} else if ocrClass != "" || capClass != "" {
+		class = "vlm_error"
+	}
+	if class != "" {
+		msg = ocrMsg
+		if capMsg != "" && len(capMsg) > len(msg) {
+			msg = capMsg
+		}
+		return types.ImageStatusEntry{
+			Status:       types.ImageStatusFailed,
+			ErrorClass:   class,
+			ErrorMessage: msg,
+		}
+	}
+	return types.ImageStatusEntry{Status: types.ImageStatusSucceeded}
+}
+
+// recordImageAttempt bumps the attempts counter and updates
+// last_attempt_at on the parent text chunk's image_statuses[url].
+// Called at the start of Handle. No-op when the parent chunk no
+// longer exists (orphan task).
+func (s *ImageMultimodalService) recordImageAttempt(
+	ctx context.Context, p types.ImageMultimodalPayload,
+) {
+	s.updateImageStatusEntry(ctx, p, func(e *types.ImageStatusEntry) {
+		e.Attempts++
+		e.LastAttemptAt = time.Now()
+	})
+}
+
+// recordImageOutcome writes the final status entry on the parent
+// chunk's image_statuses[url]. Preserves the attempts counter that
+// recordImageAttempt bumped earlier in the same call.
+//
+// Called from the deferred finalize in Handle so it runs on both
+// success and failure (and from the unreadable branch).
+func (s *ImageMultimodalService) recordImageOutcome(
+	ctx context.Context, p types.ImageMultimodalPayload, entry types.ImageStatusEntry,
+) {
+	s.updateImageStatusEntry(ctx, p, func(e *types.ImageStatusEntry) {
+		e.Status = entry.Status
+		e.ErrorClass = entry.ErrorClass
+		e.ErrorMessage = entry.ErrorMessage
+		e.LastAttemptAt = entry.LastAttemptAt
+		// entry.Attempts is typically 1 here; preserve the running
+		// counter from earlier recordImageAttempt calls.
+		if entry.Attempts > e.Attempts {
+			e.Attempts = entry.Attempts
+		}
+	})
+}
+
+// updateImageStatusEntry is the shared read-modify-write helper for
+// recordImageAttempt and recordImageOutcome. Mutates the existing
+// image_statuses[url] entry (or creates a new one), then writes the
+// parent chunk's metadata back. Silent on errors — status tracking is
+// best-effort and must not fail the actual VLM processing.
+func (s *ImageMultimodalService) updateImageStatusEntry(
+	ctx context.Context, p types.ImageMultimodalPayload,
+	mutate func(*types.ImageStatusEntry),
+) {
+	parent, err := s.chunkService.GetChunkByID(ctx, p.ChunkID)
+	if err != nil || parent == nil {
+		logger.Warnf(ctx,
+			"[ImageMultimodal] recordImageStatus: parent chunk %s not found: %v",
+			p.ChunkID, err)
+		return
+	}
+	var meta struct {
+		ImageStatuses types.ImageStatuses `json:"image_statuses"`
+	}
+	if len(parent.Metadata) > 0 {
+		if err := json.Unmarshal(parent.Metadata, &meta); err != nil {
+			logger.Warnf(ctx,
+				"[ImageMultimodal] recordImageStatus: unmarshal metadata: %v", err)
+		}
+	}
+	if meta.ImageStatuses == nil {
+		meta.ImageStatuses = types.ImageStatuses{}
+	}
+	entry := meta.ImageStatuses[p.ImageURL]
+	mutate(&entry)
+	meta.ImageStatuses[p.ImageURL] = entry
+
+	marshalled, err := json.Marshal(meta)
+	if err != nil {
+		logger.Warnf(ctx,
+			"[ImageMultimodal] recordImageStatus: marshal metadata: %v", err)
+		return
+	}
+	parent.Metadata = marshalled
+	if err := s.chunkService.UpdateChunk(ctx, parent); err != nil {
+		logger.Warnf(ctx,
+			"[ImageMultimodal] recordImageStatus: update chunk %s: %v",
+			p.ChunkID, err)
+	}
+}
+
 // Handle implements asynq handler for TypeImageMultimodal.
 func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) error {
 	var payload types.ImageMultimodalPayload
@@ -142,6 +271,11 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 
 	logger.Infof(ctx, "[ImageMultimodal] Processing image: chunk=%s, url=%s, ocr=%v, caption=%v",
 		payload.ChunkID, payload.ImageURL, payload.EnableOCR, payload.EnableCaption)
+
+	// Bump attempts counter on the parent chunk's image_statuses[url] at
+	// the start of Handle so RetryFailedImages.MaxAttempts reflects
+	// historical retry counts. No-op when the parent chunk is gone.
+	s.recordImageAttempt(ctx, payload)
 
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
 	if payload.Language != "" {
@@ -217,6 +351,13 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		}
 		if handleErr == nil || isFinalAsynqAttempt(ctx) {
 			s.checkAndFinalizeAllImages(ctx, payload)
+			// Final status write: image_statuses[url] entry that captures
+			// success vs failure and the most informative error class.
+			// Only writes here on the path where this attempt "owns" the
+			// outcome — intermediate retries leave the existing entry alone.
+			final := computeFinalStatus(imgOut)
+			final.LastAttemptAt = time.Now()
+			s.recordImageOutcome(ctx, payload, final)
 		} else {
 			logger.Infof(ctx,
 				"[ImageMultimodal] Skip finalize on retryable error for %s (will count on last attempt)",
@@ -248,6 +389,12 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		logger.Errorf(ctx, "[ImageMultimodal] Skip unreadable image %s: %v", payload.ImageURL, readErr)
 		imgOut["skipped"] = "unreadable_image"
 		imgOut["read_error"] = readErr.Error()
+		s.recordImageOutcome(ctx, payload, types.ImageStatusEntry{
+			Status:       types.ImageStatusFailed,
+			ErrorClass:   "unreadable",
+			ErrorMessage: readErr.Error(),
+			LastAttemptAt: time.Now(),
+		})
 		return nil
 	}
 	imgOut["image_bytes"] = len(imgBytes)
@@ -270,8 +417,10 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 
 		ocrText, ocrErr := vlmModel.Predict(ctx, [][]byte{imgBytes}, prompt)
 		if ocrErr != nil {
-			logger.Warnf(ctx, "[ImageMultimodal] OCR failed for %s: %v", payload.ImageURL, ocrErr)
+			class := classifyVLMError(ocrErr)
+			logger.Warnf(ctx, "[ImageMultimodal] OCR failed (%s) for %s: %v", class, payload.ImageURL, ocrErr)
 			imgOut["ocr_error"] = ocrErr.Error()
+			imgOut["ocr_error_class"] = class
 		} else {
 			ocrText = sanitizeOCRText(ocrText)
 			if ocrText != "" {
@@ -288,8 +437,10 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 
 	caption, capErr := vlmModel.Predict(ctx, [][]byte{imgBytes}, buildVLMCaptionPrompt(ctx, vlmCfg))
 	if capErr != nil {
-		logger.Warnf(ctx, "[ImageMultimodal] Caption failed for %s: %v", payload.ImageURL, capErr)
+		class := classifyVLMError(capErr)
+		logger.Warnf(ctx, "[ImageMultimodal] Caption failed (%s) for %s: %v", class, payload.ImageURL, capErr)
 		imgOut["caption_error"] = capErr.Error()
+		imgOut["caption_error_class"] = class
 	} else if caption != "" {
 		imageInfo.Caption = caption
 		imgOut["caption_chars"] = len([]rune(caption))

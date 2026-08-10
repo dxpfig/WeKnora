@@ -190,6 +190,43 @@ type Knowledge struct {
 	KnowledgeBaseName string `json:"knowledge_base_name" gorm:"-"`
 }
 
+// RetryFailedImagesOptions controls the operator-driven manual retry
+// endpoint (POST /knowledge/{id}/retry-failed-images).
+//
+// Defaults (applied by the handler when fields are zero/empty):
+//   - OnlyErrorClasses: ["rate_limit"]  — only retry rate-limited images
+//     (other failures like "vlm_error" usually indicate permanent problems)
+//   - MaxAttempts:      0 (no cap)      — retry regardless of attempts count
+//   - DryRun:           false           — actually enqueue tasks
+type RetryFailedImagesOptions struct {
+	OnlyErrorClasses []string `json:"only_error_classes,omitempty"`
+	MaxAttempts      int      `json:"max_attempts,omitempty"`
+	DryRun           bool     `json:"dry_run,omitempty"`
+}
+
+// RetryFailedImagesResult is the handler response. Counts let the
+// operator see at-a-glance how many images were retried vs filtered out
+// vs total failed.
+type RetryFailedImagesResult struct {
+	KnowledgeID string `json:"knowledge_id"`
+	Requeued    int    `json:"requeued"`
+	Skipped     int    `json:"skipped"`
+	TotalFailed int    `json:"total_failed"`
+}
+
+// ImageStatusReport is one row in the GET /knowledge/{id}/image-statuses
+// response. Aggregated from chunks.metadata.image_statuses across every
+// parent text chunk in the knowledge.
+type ImageStatusReport struct {
+	ImageURL      string    `json:"image_url"`
+	ParentChunkID string    `json:"parent_chunk_id"`
+	Status        string    `json:"status"`
+	ErrorClass    string    `json:"error_class,omitempty"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
+	Attempts      int       `json:"attempts"`
+	LastAttemptAt time.Time `json:"last_attempt_at"`
+}
+
 // CustomMetadataText returns stable human-readable metadata for summaries and
 // document-scoped model context. Internal ingestion metadata is intentionally
 // excluded.

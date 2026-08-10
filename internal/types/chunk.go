@@ -177,6 +177,40 @@ type Chunk struct {
 	ContextHeader string `json:"-" gorm:"type:text"`
 }
 
+// ImageStatus records the per-image processing outcome for a parent
+// text chunk. Lives under chunks.metadata["image_statuses"][image_url]
+// (JSONB) for the text chunk that owns the image (via chunks.parent_chunk_id).
+//
+// Keeping the status inside the parent chunk's metadata avoids a new
+// table and keeps the cherry-pick surface against upstream minimal —
+// every image status is naturally scoped under its owning chunk.
+type ImageStatus string
+
+const (
+	// ImageStatusSucceeded means OCR and/or caption produced non-empty
+	// child chunks (or the image was correctly skipped, e.g. empty
+	// content — see image_multimodal.go's no_extracted_content branch).
+	ImageStatusSucceeded ImageStatus = "succeeded"
+	// ImageStatusFailed means the VLM call errored and no usable
+	// child chunks were produced. ErrorClass disambiguates the cause.
+	ImageStatusFailed ImageStatus = "failed"
+)
+
+// ImageStatusEntry is the value stored at image_statuses[image_url].
+// Persisted as JSON inside chunks.metadata, so all fields use JSON
+// tags and omit-empty values keep the column lean.
+type ImageStatusEntry struct {
+	Status        ImageStatus `json:"status"`
+	ErrorClass    string      `json:"error_class,omitempty"`    // "rate_limit" | "vlm_error" | "unreadable" | "other"
+	ErrorMessage  string      `json:"error_message,omitempty"`  // last error text, truncated by caller
+	LastAttemptAt time.Time   `json:"last_attempt_at"`
+	Attempts      int         `json:"attempts"`
+}
+
+// ImageStatuses is the map persisted under chunks.metadata["image_statuses"],
+// keyed by the provider:// image URL used as the asynq task identity.
+type ImageStatuses map[string]ImageStatusEntry
+
 // ChunkRevision is an immutable snapshot of a superseded chunk revision.
 // The current content lives on Chunk; this table stores prior versions.
 type ChunkRevision struct {

@@ -353,6 +353,16 @@ func (s *chunkService) DeleteByKnowledgeList(ctx context.Context, ids []string) 
 	return nil
 }
 
+// SoftDeleteImageChildren marks image_ocr / image_caption child chunks
+// for (parentChunkID, imageURL) as soft-deleted. Idempotent. Used by
+// RetryFailedImages to keep a retry from double-indexing.
+func (s *chunkService) SoftDeleteImageChildren(
+	ctx context.Context, tenantID uint64, parentChunkID, imageURL string,
+) error {
+	logger.Infof(ctx, "[Chunk] Soft-deleting image children parent=%s url=%s", parentChunkID, imageURL)
+	return s.chunkRepository.SoftDeleteImageChildren(ctx, tenantID, parentChunkID, imageURL)
+}
+
 func (s *chunkService) ListChunkByParentID(
 	ctx context.Context,
 	tenantID uint64,

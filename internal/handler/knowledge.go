@@ -1994,6 +1994,120 @@ func (h *KnowledgeHandler) ReparseKnowledge(c *gin.Context) {
 	})
 }
 
+// ListImageStatuses godoc
+// @Summary      列出知识中所有图片的处理状态
+// @Description  返回每张图片的成功/失败状态、错误类型、最近尝试时间。
+// @Tags         知识管理
+// @Produce      json
+// @Param        id   path      string  true  "知识ID"
+// @Success      200  {object}  map[string]interface{}
+// @Failure      403  {object}  errors.AppError
+// @Security     Bearer
+// @Router       /knowledge/{id}/image-statuses [get]
+func (h *KnowledgeHandler) ListImageStatuses(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start listing image statuses")
+
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		logger.Error(ctx, "Knowledge ID is empty")
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleViewer)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	reports, err := h.kgService.ListImageStatuses(effCtx, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"knowledge_id": id})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	// Build summary counts.
+	summary := map[string]int{"total": len(reports), "succeeded": 0, "failed": 0}
+	for _, r := range reports {
+		if r.Status == string(types.ImageStatusFailed) {
+			summary["failed"]++
+		} else if r.Status == string(types.ImageStatusSucceeded) {
+			summary["succeeded"]++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"knowledge_id": id,
+			"images":       reports,
+			"summary":      summary,
+		},
+	})
+}
+
+// RetryFailedImages godoc
+// @Summary      重试失败的图片
+// @Description  重新入队失败的图片处理任务。默认仅重试被识别为 rate_limit 的图片，跳过尝试次数 >= max_attempts 的。
+// @Tags         知识管理
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "知识ID"
+// @Param        body body      types.RetryFailedImagesOptions  false  "过滤选项"
+// @Success      200  {object}  map[string]interface{}
+// @Failure      403  {object}  errors.AppError
+// @Security     Bearer
+// @Router       /knowledge/{id}/retry-failed-images [post]
+func (h *KnowledgeHandler) RetryFailedImages(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start retrying failed images")
+
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		logger.Error(ctx, "Knowledge ID is empty")
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	var opts types.RetryFailedImagesOptions
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&opts); err != nil {
+			logger.Error(ctx, "Failed to parse retry request body", err)
+			c.Error(errors.NewBadRequestError("Invalid retry request body").WithDetails(err.Error()))
+			return
+		}
+	}
+
+	result, err := h.kgService.RetryFailedImages(effCtx, id, opts)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"knowledge_id": id})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	logger.Infof(ctx,
+		"Retry result: knowledge=%s requeued=%d skipped=%d total_failed=%d",
+		secutils.SanitizeForLog(id), result.Requeued, result.Skipped, result.TotalFailed)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Image retry tasks submitted",
+		"data":    result,
+	})
+}
+
 // CancelKnowledgeParse godoc
 // @Summary      取消知识解析
 // @Description  取消进行中的知识解析任务。当前已写入的 chunk / 索引保留，可通过 reparse 接口重新触发解析。已完成 / 已失败 / 删除中的知识不支持取消。

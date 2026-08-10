@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,11 @@ import (
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
+	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -1063,4 +1066,204 @@ func (s *knowledgeService) SearchKnowledgeForScopes(ctx context.Context, scopes 
 		return nil, false, 0, nil
 	}
 	return s.repo.SearchKnowledgeInScopes(ctx, scopes, keyword, offset, limit, fileTypes)
+}
+
+// ListImageStatuses returns per-image processing status for every
+// image attached to a parent text chunk in this knowledge.
+//
+// Statuses are read from chunks.metadata["image_statuses"] (JSONB) on
+// each text chunk. Images that have never been processed do not appear
+// in the result (no status row written). The handler wraps this in
+// {images: [...], summary: {...}} for the API response.
+//
+// Returns an empty slice when the knowledge has no image-containing
+// chunks or none of them have been processed yet.
+func (s *knowledgeService) ListImageStatuses(
+	ctx context.Context, knowledgeID string,
+) ([]types.ImageStatusReport, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+
+	chunks, err := s.chunkRepo.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return nil, fmt.Errorf("list chunks by knowledge: %w", err)
+	}
+
+	var reports []types.ImageStatusReport
+	for _, c := range chunks {
+		if len(c.Metadata) == 0 {
+			continue
+		}
+		var meta struct {
+			ImageStatuses types.ImageStatuses `json:"image_statuses"`
+		}
+		if err := json.Unmarshal(c.Metadata, &meta); err != nil || len(meta.ImageStatuses) == 0 {
+			continue
+		}
+		for imageURL, entry := range meta.ImageStatuses {
+			reports = append(reports, types.ImageStatusReport{
+				ImageURL:      imageURL,
+				ParentChunkID: c.ID,
+				Status:        string(entry.Status),
+				ErrorClass:    entry.ErrorClass,
+				ErrorMessage:  entry.ErrorMessage,
+				Attempts:      entry.Attempts,
+				LastAttemptAt: entry.LastAttemptAt,
+			})
+		}
+	}
+	return reports, nil
+}
+
+// shouldRetryImage applies opts.OnlyErrorClasses and opts.MaxAttempts
+// to a single (imageURL, entry) pair. Returns true when the image
+// qualifies for retry, false when it should be skipped. The reason
+// string is included in operator-facing log lines so they can see WHY
+// an image was skipped.
+//
+// Rules (decided 2026-08-10):
+//   1. Only retry when entry.Status == ImageStatusFailed. Succeeded
+//      images are already done.
+//   2. If opts.OnlyErrorClasses is empty, retry any failed image
+//      (caller opted out of filtering). When non-empty, only retry
+//      images whose ErrorClass is in the set.
+//   3. Strict MaxAttempts semantics: when opts.MaxAttempts > 0 and
+//      entry.Attempts >= opts.MaxAttempts, skip. MaxAttempts == 0
+//      means "no cap, caller is responsible".
+func shouldRetryImage(
+	imageURL string, entry types.ImageStatusEntry, opts types.RetryFailedImagesOptions,
+) (shouldRetry bool, reason string) {
+	_ = imageURL // reserved for future context-aware decisions
+
+	if entry.Status != types.ImageStatusFailed {
+		return false, fmt.Sprintf("not in failed state (current: %s)", entry.Status)
+	}
+	if len(opts.OnlyErrorClasses) > 0 && !slices.Contains(opts.OnlyErrorClasses, entry.ErrorClass) {
+		return false, fmt.Sprintf("not a retriable error type (class=%s not in filter)", entry.ErrorClass)
+	}
+	if opts.MaxAttempts > 0 && entry.Attempts >= opts.MaxAttempts {
+		return false, fmt.Sprintf("reached max attempts (attempts=%d, max=%d)", entry.Attempts, opts.MaxAttempts)
+	}
+	return true, ""
+}
+
+// RetryFailedImages re-enqueues asynq TypeImageMultimodal tasks for
+// every failed image in this knowledge that matches opts. Default
+// behavior (zero-value opts): only retry rate_limit failures, no cap
+// on attempts.
+//
+// Idempotency: existing image_ocr/image_caption children for each
+// retried (parent_chunk_id, image_url) pair are soft-deleted before
+// the new task runs, so re-running leaves no orphan children.
+//
+// Returns counts (requeued, skipped, total_failed). When opts.DryRun is
+// true, no tasks are enqueued and no soft-deletes are issued — only
+// the counts are returned.
+func (s *knowledgeService) RetryFailedImages(
+	ctx context.Context, knowledgeID string, opts types.RetryFailedImagesOptions,
+) (types.RetryFailedImagesResult, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	result := types.RetryFailedImagesResult{KnowledgeID: knowledgeID}
+
+	chunks, err := s.chunkRepo.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return result, fmt.Errorf("list chunks by knowledge: %w", err)
+	}
+
+	// Collect (parentChunkID, imageURL, entry) for every failed image.
+	type cand struct {
+		parentChunkID string
+		imageURL      string
+		entry         types.ImageStatusEntry
+	}
+	var candidates []cand
+	for _, c := range chunks {
+		if len(c.Metadata) == 0 {
+			continue
+		}
+		var meta struct {
+			ImageStatuses types.ImageStatuses `json:"image_statuses"`
+		}
+		if err := json.Unmarshal(c.Metadata, &meta); err != nil {
+			continue
+		}
+		for imageURL, entry := range meta.ImageStatuses {
+			if entry.Status == types.ImageStatusFailed {
+				candidates = append(candidates, cand{c.ID, imageURL, entry})
+				result.TotalFailed++
+			}
+		}
+	}
+
+	for _, k := range candidates {
+		retry, why := shouldRetryImage(k.imageURL, k.entry, opts)
+		if !retry {
+			result.Skipped++
+			logger.Infof(ctx,
+				"[RetryFailedImages] skip parent=%s url=%s reason=%s",
+				k.parentChunkID, k.imageURL, why)
+			continue
+		}
+		if opts.DryRun {
+			result.Requeued++ // dry-run counts the would-be requeue
+			continue
+		}
+		// Idempotency: soft-delete existing OCR/caption children for this image.
+		if err := s.chunkService.SoftDeleteImageChildren(
+			ctx, tenantID, k.parentChunkID, k.imageURL,
+		); err != nil {
+			logger.Errorf(ctx,
+				"[RetryFailedImages] soft-delete failed parent=%s url=%s: %v",
+				k.parentChunkID, k.imageURL, err)
+			result.Skipped++
+			continue
+		}
+		// Enqueue a fresh asynq TypeImageMultimodal task with the same
+		// identity as the original — Handle will re-run OCR + caption
+		// and write a new image_statuses entry (overwriting the failed one).
+		parent, err := s.chunkRepo.GetChunkByID(ctx, tenantID, k.parentChunkID)
+		if err != nil || parent == nil {
+			logger.Errorf(ctx,
+				"[RetryFailedImages] parent chunk lookup failed %s: %v",
+				k.parentChunkID, err)
+			result.Skipped++
+			continue
+		}
+		payload := types.ImageMultimodalPayload{
+			TenantID:        parent.TenantID,
+			KnowledgeID:     parent.KnowledgeID,
+			KnowledgeBaseID: parent.KnowledgeBaseID,
+			ChunkID:         parent.ID,
+			ImageURL:        k.imageURL,
+			EnableOCR:       true,
+			EnableCaption:   true,
+			Language:        "",
+			ImageSourceType: "",
+		}
+		langfuse.InjectTracing(ctx, &payload)
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			logger.Errorf(ctx,
+				"[RetryFailedImages] marshal payload failed url=%s: %v",
+				k.imageURL, err)
+			result.Skipped++
+			continue
+		}
+		task := asynq.NewTask(types.TypeImageMultimodal, payloadBytes,
+			asynq.Queue(types.QueueMultimodal),
+			asynq.MaxRetry(3),
+			asynq.Timeout(30*time.Minute),
+		)
+		if _, err := s.task.Enqueue(task); err != nil {
+			logger.Errorf(ctx,
+				"[RetryFailedImages] enqueue failed url=%s: %v",
+				k.imageURL, err)
+			result.Skipped++
+			continue
+		}
+		result.Requeued++
+		logger.Infof(ctx,
+			"[RetryFailedImages] requeued image=%s parent=%s",
+			k.imageURL, k.parentChunkID)
+	}
+	return result, nil
 }

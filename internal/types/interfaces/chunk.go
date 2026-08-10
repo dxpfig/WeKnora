@@ -122,6 +122,18 @@ type ChunkRepository interface {
 	// Filter by kbIDs and/or knowledgeIDs. At least one of them must be non-empty.
 	// Returns up to `limit` chunks sorted by updated_at descending.
 	ListRecentDocumentChunksWithQuestions(ctx context.Context, tenantID uint64, kbIDs []string, knowledgeIDs []string, limit int) ([]*types.Chunk, error)
+
+	// SoftDeleteImageChildren marks image_ocr and image_caption child
+	// chunks matching (parent_chunk_id, image_url) as soft-deleted by
+	// setting deleted_at. Used by RetryFailedImages to enforce
+	// idempotency — previous OCR/caption children are deleted before a
+	// fresh task runs, so the retry does not double-index the image.
+	// Idempotent: calling on already-deleted children is a no-op.
+	//
+	// image_url is matched against chunks.image_info (JSONB on Postgres)
+	// so the same retry across image_url variants only touches the
+	// matching subset.
+	SoftDeleteImageChildren(ctx context.Context, tenantID uint64, parentChunkID, imageURL string) error
 }
 
 // ChunkService defines the interface for chunk service operations
@@ -168,4 +180,7 @@ type ChunkService interface {
 	RevertDocumentChunk(ctx context.Context, chunkID string, revision int, expectedRevision *int) (*types.Chunk, error)
 	// UpsertGeneratedQuestion creates or updates a generated retrieval question.
 	UpsertGeneratedQuestion(ctx context.Context, chunkID string, questionID string, question string) (*types.GeneratedQuestion, error)
+	// SoftDeleteImageChildren delegates to ChunkRepository.SoftDeleteImageChildren.
+	// See repository method for full semantics.
+	SoftDeleteImageChildren(ctx context.Context, tenantID uint64, parentChunkID, imageURL string) error
 }

@@ -529,6 +529,30 @@ func (r *chunkRepository) DeleteChunksByKnowledgeID(ctx context.Context, tenantI
 	).Delete(&types.Chunk{}).Error
 }
 
+// SoftDeleteImageChildren marks image_ocr and image_caption child
+// chunks matching (parent_chunk_id, image_url) as soft-deleted by
+// setting deleted_at. Idempotent.
+//
+// The image_url match uses Postgres jsonb_path_ops containment on
+// image_info (which is stored as JSON text). %q ensures safe quoting of
+// the URL so special characters in URLs do not break the JSON literal.
+// The image_info != '' guard avoids casting empty strings to jsonb (which
+// would raise an error).
+func (r *chunkRepository) SoftDeleteImageChildren(
+	ctx context.Context, tenantID uint64, parentChunkID, imageURL string,
+) error {
+	imageInfoJSON := fmt.Sprintf(`[{"url":%q}]`, imageURL)
+	return r.db.WithContext(ctx).
+		Model(&types.Chunk{}).
+		Where(
+			"tenant_id = ? AND parent_chunk_id = ? AND chunk_type IN ? AND deleted_at IS NULL",
+			tenantID, parentChunkID,
+			[]types.ChunkType{types.ChunkTypeImageOCR, types.ChunkTypeImageCaption},
+		).
+		Where("image_info != '' AND image_info::jsonb @> ?", imageInfoJSON).
+		Update("deleted_at", time.Now()).Error
+}
+
 // ListImageInfoByKnowledgeIDs returns non-empty image_info values for the given knowledge IDs.
 // No chunk_type filter — collects from text, image_ocr, and image_caption chunks.
 func (r *chunkRepository) ListImageInfoByKnowledgeIDs(

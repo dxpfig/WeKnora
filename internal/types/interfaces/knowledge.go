@@ -135,6 +135,22 @@ type KnowledgeService interface {
 	// is already cancelled. Returns an error when the knowledge is in a
 	// terminal state (completed / failed) or being deleted.
 	CancelKnowledgeParse(ctx context.Context, knowledgeID string) (*types.Knowledge, error)
+	// ListImageStatuses returns per-image processing status for every
+	// image attached to a parent text chunk in this knowledge. Aggregated
+	// from chunks.metadata.image_statuses (JSONB). Empty list when no
+	// images have been processed or all attempts succeeded.
+	ListImageStatuses(ctx context.Context, knowledgeID string) ([]types.ImageStatusReport, error)
+	// RetryFailedImages re-enqueues asynq TypeImageMultimodal tasks for
+	// images that failed processing. Used by the operator after a
+	// transient upstream failure (e.g. provider rate limit) clears.
+	// Idempotency: existing OCR/caption child chunks for the retried
+	// (parent_chunk_id, image_url) pair are soft-deleted before the new
+	// task runs, so re-running leaves no orphan children.
+	RetryFailedImages(
+		ctx context.Context,
+		knowledgeID string,
+		opts types.RetryFailedImagesOptions,
+	) (types.RetryFailedImagesResult, error)
 	// CloneKnowledgeBase clones knowledge to another knowledge base.
 	CloneKnowledgeBase(ctx context.Context, srcID, dstID string) error
 	// UpdateImageInfo updates image information for a knowledge chunk.
