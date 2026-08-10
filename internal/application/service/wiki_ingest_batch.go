@@ -17,6 +17,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/utils/ratelimit"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"golang.org/x/sync/errgroup"
@@ -517,7 +518,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				mapMu.Lock()
 				ingestFailed++
 				failedOps = append(failedOps, op)
-				if isLikelyRateLimitError(err) {
+				if ratelimit.IsLikelyRateLimitError(err) {
 					rateLimited = true
 				}
 				mapMu.Unlock()
@@ -656,7 +657,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				// instead of silently dropping the row at trim time.
 				logger.Warnf(reduceCtx, "wiki ingest: reduce failed for slug %s: %v", slug, reduceErr)
 				collectUnapplied(updates)
-				if isLikelyRateLimitError(reduceErr) {
+				if ratelimit.IsLikelyRateLimitError(reduceErr) {
 					reduceMu.Lock()
 					rateLimited = true
 					reduceMu.Unlock()

@@ -21,6 +21,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils/ratelimit"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -587,7 +588,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			// Map vector store / embedding rate-limit errors to a
 			// stable code so the UI can offer "retry later" hints.
 			code := werrors.ErrCodeVectorStoreWriteFailed
-			if isLikelyRateLimitError(err) {
+			if ratelimit.IsLikelyRateLimitError(err) {
 				code = werrors.ErrCodeEmbeddingRateLimit
 			}
 			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
@@ -3725,24 +3726,6 @@ func (s *knowledgeService) callDocReaderWithTimeout(
 	}
 	logger.Infof(ctx, "[convert] docreader call ok in %s for %q", elapsed, req.FileName)
 	return result, nil
-}
-
-// isLikelyRateLimitError performs a fuzzy classification of an error as a
-// rate-limit / quota / backpressure failure. We only need a hint — the
-// caller maps to one of two error_codes so the UI can offer "retry later"
-// vs. "fix configuration" advice. False positives are harmless (the
-// detail is preserved in error_detail anyway).
-func isLikelyRateLimitError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, needle := range []string{"rate limit", "ratelimit", "429", "too many requests", "quota"} {
-		if strings.Contains(msg, needle) {
-			return true
-		}
-	}
-	return false
 }
 
 // Returns nil when the required service is unavailable.
