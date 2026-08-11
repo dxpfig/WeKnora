@@ -2,7 +2,18 @@
 import { ref, reactive, onMounted, onBeforeUnmount, watch, computed, nextTick } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
-import { getKnowledgeSpans, reparseKnowledge, cancelKnowledgeParse, getKnowledgeDetails } from '@/api/knowledge-base/index'
+import {
+  getKnowledgeSpans,
+  reparseKnowledge,
+  cancelKnowledgeParse,
+  getKnowledgeDetails,
+  listImageStatuses,
+  retryFailedImages,
+  listWikiStatuses,
+  retryFailedWikis,
+  type ImageStatusReport,
+  type WikiStatusReport,
+} from '@/api/knowledge-base/index'
 import {
   groupPostprocessGraphSpans,
   knowledgeSpansPayloadHasTrace,
@@ -119,6 +130,17 @@ const userToggledRows = ref<Set<string>>(new Set())
 // caption ages without explanation.
 const failedAttempts = ref<number>(0)
 const lastFetchOk = ref<boolean>(true)
+
+// Per-image / per-wiki failure surface. Indexed by image_url / slug
+// so the row renderer can look up the matching entry without scanning.
+// These come from /image-statuses and /wiki-statuses (which read the
+// JSONB metadata on chunks), NOT from span.status — a span can be
+// done while its underlying image/wiki failed.
+const imageStatusMap = ref<Map<string, ImageStatusReport>>(new Map())
+const wikiStatusMap = ref<Map<string, WikiStatusReport>>(new Map())
+const retryingImage = ref<boolean>(false)
+const retryingWikis = ref<boolean>(false)
+const retryingSpan = ref<string | null>(null)
 
 const attemptStatuses = reactive<Map<number, string>>(new Map())
 
@@ -375,6 +397,9 @@ async function fetchSpans(opts: { manual?: boolean } = {}) {
       }
       for (const stage of data.value.trace?.children || []) autoExpand(stage)
       expandedRows.value = expanded
+      // Refresh the per-image / per-wiki failure surface alongside
+      // the trace tree so badges stay in sync after each poll.
+      fetchFailureStatuses()
       const latestAttempt = data.value.latest_attempt || data.value.attempt || 0
       const tabStatus = resolveTimelineHeaderStatus({
         parseStatus: data.value.parse_status,
@@ -467,9 +492,151 @@ async function onRetry() {
     attemptStatuses.clear()
     selectedSpanId.value = null
     await fetchSpans()
+    await fetchFailureStatuses()
   } catch {
     // ignore
   }
+}
+
+// fetchFailureStatuses refreshes the per-image and per-wiki failure
+// maps. Called from onMounted + every fetchSpans success + after any
+// retry (image / wiki) so the badges update promptly. Best-effort:
+// swallow errors and log to console — the timeline is still useful
+// even if this layer is broken.
+async function fetchFailureStatuses() {
+  if (!props.knowledgeId) return
+  const nextImage = new Map<string, ImageStatusReport>()
+  const nextWiki = new Map<string, WikiStatusReport>()
+  try {
+    const res: any = await listImageStatuses(props.knowledgeId)
+    if (res?.success && Array.isArray(res.data?.images)) {
+      for (const r of res.data.images as ImageStatusReport[]) {
+        if (r.image_url) nextImage.set(r.image_url, r)
+      }
+    }
+  } catch (e) {
+    console.warn('[KnowledgeTimeline] listImageStatuses failed', e)
+  }
+  try {
+    const res: any = await listWikiStatuses(props.knowledgeId)
+    if (res?.success && Array.isArray(res.data?.wikis)) {
+      for (const r of res.data.wikis as WikiStatusReport[]) {
+        if (r.slug) nextWiki.set(r.slug, r)
+      }
+    }
+  } catch (e) {
+    console.warn('[KnowledgeTimeline] listWikiStatuses failed', e)
+  }
+  imageStatusMap.value = nextImage
+  wikiStatusMap.value = nextWiki
+}
+
+// onRetryFailedImages fires from the header retry button. Default
+// filter is rate_limit only (matches the backend default — same as
+// RetryFailedImagesOptions default in types/knowledge.go).
+async function onRetryFailedImages() {
+  if (!props.knowledgeId || retryingImage.value) return
+  retryingImage.value = true
+  try {
+    await retryFailedImages(props.knowledgeId, { only_error_classes: ['rate_limit'] })
+    MessagePlugin.success(t('knowledgeStages.retryFailedImages'))
+    await fetchSpans({ manual: true })
+    await fetchFailureStatuses()
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  } finally {
+    retryingImage.value = false
+  }
+}
+
+// onRetryFailedWikis is the wiki counterpart of onRetryFailedImages.
+async function onRetryFailedWikis() {
+  if (!props.knowledgeId || retryingWikis.value) return
+  retryingWikis.value = true
+  try {
+    await retryFailedWikis(props.knowledgeId, { only_error_classes: ['rate_limit'] })
+    MessagePlugin.success(t('knowledgeStages.retryFailedWikis'))
+    await fetchSpans({ manual: true })
+    await fetchFailureStatuses()
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  } finally {
+    retryingWikis.value = false
+  }
+}
+
+// onRetrySpanImage / onRetrySpanWiki fire from the per-span detail
+// panel button. Both ultimately re-enqueue the same backend tasks as
+// the bulk buttons; they exist so the user doesn't have to scroll back
+// to the header after picking a span.
+async function onRetrySpanImage() {
+  if (retryingSpan.value) return
+  retryingSpan.value = 'image'
+  try {
+    await retryFailedImages(props.knowledgeId, { only_error_classes: ['rate_limit'] })
+    MessagePlugin.success(t('knowledgeStages.retryFailedImages'))
+    await fetchSpans({ manual: true })
+    await fetchFailureStatuses()
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  } finally {
+    retryingSpan.value = null
+  }
+}
+async function onRetrySpanWiki() {
+  if (retryingSpan.value) return
+  retryingSpan.value = 'wiki'
+  try {
+    await retryFailedWikis(props.knowledgeId, { only_error_classes: ['rate_limit'] })
+    MessagePlugin.success(t('knowledgeStages.retryFailedWikis'))
+    await fetchSpans({ manual: true })
+    await fetchFailureStatuses()
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  } finally {
+    retryingSpan.value = null
+  }
+}
+
+// isImageSpanName / isWikiSpanName recognise the row.name patterns
+// emitted by image_multimodal.go and wiki_ingest*.go. Centralised so
+// the row renderer and detail panel agree on what counts as a
+// retryable row.
+function isImageSpanName(name: string | undefined): boolean {
+  return !!name && /^multimodal\.image\[\d+\]$/.test(name)
+}
+function isWikiPageSpanName(name: string | undefined): boolean {
+  return !!name && /^postprocess\.wiki\.page\[.+\]$/.test(name)
+}
+function isWikiSubSpanName(name: string | undefined): boolean {
+  return !!name && /^postprocess\.wiki\./.test(name)
+}
+
+// extractSlug pulls "summary/foo" out of "postprocess.wiki.page[summary/foo]".
+function extractWikiSlug(name: string | undefined): string | null {
+  if (!name) return null
+  const m = /^postprocess\.wiki\.page\[(.+)\]$/.exec(name)
+  return m ? m[1] : null
+}
+
+// Counts used by the header badges — "3 images failed" / "2 wikis failed".
+const failedImageCount = computed(
+  () => Array.from(imageStatusMap.value.values()).filter((r) => r.status === 'failed').length,
+)
+const failedWikiCount = computed(
+  () => Array.from(wikiStatusMap.value.values()).filter((r) => r.status === 'failed').length,
+)
+
+// Lookup helpers used by the row renderer. `row` is a FlatRow from
+// the existing iter; we read the image_url out of node.input.
+function imageStatusForRow(row: any): ImageStatusReport | undefined {
+  if (!row?.node?.input) return undefined
+  const url = (row.node.input as Record<string, unknown>).image_url as string | undefined
+  return url ? imageStatusMap.value.get(url) : undefined
+}
+function wikiStatusForRow(row: any): WikiStatusReport | undefined {
+  const slug = extractWikiSlug(row?.node?.name)
+  return slug ? wikiStatusMap.value.get(slug) : undefined
 }
 
 async function onManualRefresh() {
@@ -554,6 +721,7 @@ async function fetchProcessOverrides() {
 
 onMounted(() => {
   fetchSpans()
+  fetchFailureStatuses()
   fetchProcessOverrides()
   // One permanent interval for the entire component lifetime. The
   // tick decides whether to actually fetch — no clearing, no
@@ -1484,6 +1652,28 @@ const processConfigLines = computed<string[]>(() => {
                 <t-icon name="refresh" size="14px" />
                 <span style="margin-left: 4px">{{ t('knowledgeStages.retry') }}</span>
               </t-button>
+              <span v-if="failedImageCount > 0" class="kp-failed-badge kp-failed-badge-image"
+                :title="t('knowledgeStages.failedImagesBadge', { n: failedImageCount })">
+                <t-icon name="image-1" size="12px" />
+                {{ t('knowledgeStages.failedImagesBadge', { n: failedImageCount }) }}
+              </span>
+              <t-button v-if="failedImageCount > 0" size="small" theme="danger" variant="outline"
+                :loading="retryingImage" :disabled="retryingImage"
+                @click="onRetryFailedImages">
+                <t-icon name="refresh" size="14px" />
+                <span style="margin-left: 4px">{{ t('knowledgeStages.retryFailedImages') }}</span>
+              </t-button>
+              <span v-if="failedWikiCount > 0" class="kp-failed-badge kp-failed-badge-wiki"
+                :title="t('knowledgeStages.failedWikisBadge', { n: failedWikiCount })">
+                <t-icon name="book" size="12px" />
+                {{ t('knowledgeStages.failedWikisBadge', { n: failedWikiCount }) }}
+              </span>
+              <t-button v-if="failedWikiCount > 0" size="small" theme="danger" variant="outline"
+                :loading="retryingWikis" :disabled="retryingWikis"
+                @click="onRetryFailedWikis">
+                <t-icon name="refresh" size="14px" />
+                <span style="margin-left: 4px">{{ t('knowledgeStages.retryFailedWikis') }}</span>
+              </t-button>
               <button v-if="showClose" type="button" class="kp-icon-btn" :aria-label="t('knowledgeStages.close')"
                 :title="t('knowledgeStages.close')" @click="emit('close')">
                 <t-icon name="close" size="16px" />
@@ -1573,6 +1763,16 @@ const processConfigLines = computed<string[]>(() => {
                       :class="{ 'kp-name-root': row.isRoot, 'kp-name-mono': !row.isRoot && !row.isStage }">{{
                         rowLabel(row) }}</span>
                     <span class="kp-name-kind">{{ rowKindLabel(row) }}</span>
+                    <span v-if="isImageSpanName(row.node.name) && imageStatusForRow(row)?.status === 'failed'"
+                      class="kp-row-badge kp-row-badge-failed"
+                      :title="imageStatusForRow(row)?.error_message || ''">
+                      {{ t('knowledgeStages.status.failed') }}
+                    </span>
+                    <span v-if="isWikiPageSpanName(row.node.name) && wikiStatusForRow(row)?.status === 'failed'"
+                      class="kp-row-badge kp-row-badge-failed"
+                      :title="wikiStatusForRow(row)?.error_message || ''">
+                      {{ t('knowledgeStages.status.failed') }}
+                    </span>
                   </div>
                 </div>
 
@@ -1642,6 +1842,20 @@ const processConfigLines = computed<string[]>(() => {
                 </span>
               </div>
               <div class="kp-detail-actions">
+                <t-button v-if="isImageSpanName(selectedRow?.node?.name) && imageStatusForRow(selectedRow)?.status === 'failed'"
+                  size="small" theme="danger" variant="outline"
+                  :loading="retryingSpan === 'image'" :disabled="!!retryingSpan"
+                  @click.stop="onRetrySpanImage">
+                  <t-icon name="refresh" size="14px" />
+                  <span style="margin-left: 4px">{{ t('knowledgeStages.retryThisImage') }}</span>
+                </t-button>
+                <t-button v-if="isWikiSubSpanName(selectedRow?.node?.name) && (wikiStatusForRow(selectedRow)?.status === 'failed' || isWikiPageSpanName(selectedRow?.node?.name))"
+                  size="small" theme="danger" variant="outline"
+                  :loading="retryingSpan === 'wiki'" :disabled="!!retryingSpan"
+                  @click.stop="onRetrySpanWiki">
+                  <t-icon name="refresh" size="14px" />
+                  <span style="margin-left: 4px">{{ t('knowledgeStages.retryThisWiki') }}</span>
+                </t-button>
                 <button type="button" class="kp-icon-btn" :title="t('knowledgeStages.copyDetails')"
                   @click.stop="copySpan(selectedRow.node)">
                   <t-icon name="copy" size="18px" />
@@ -3315,5 +3529,48 @@ const processConfigLines = computed<string[]>(() => {
   line-height: 1.6;
   color: var(--td-text-color-secondary);
   word-break: break-word;
+}
+
+/* Per-image / per-wiki failure surface — header badges + inline row badges.
+ * Mirrors the visual weight of kp-bar-failed (the timeline's existing
+ * red) so users see a consistent failure vocabulary across the
+ * span tree. */
+.kp-failed-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.4;
+  border: 1px solid var(--td-error-color);
+  background: var(--td-error-color-1);
+  color: var(--td-error-color);
+  white-space: nowrap;
+}
+.kp-failed-badge-image {
+  border-color: var(--td-error-color);
+}
+.kp-failed-badge-wiki {
+  border-color: var(--td-warning-color, #e37318);
+  background: var(--td-warning-color-1, #fff3e0);
+  color: var(--td-warning-color, #e37318);
+}
+.kp-row-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 16px;
+  background: var(--td-error-color-1);
+  color: var(--td-error-color);
+  border: 1px solid var(--td-error-color);
+  white-space: nowrap;
+  cursor: default;
+}
+.kp-row-badge-failed {
+  /* same red as kp-bar-failed so users read the same vocabulary */
 }
 </style>

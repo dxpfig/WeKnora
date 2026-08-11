@@ -227,6 +227,41 @@ type ImageStatusReport struct {
 	LastAttemptAt time.Time `json:"last_attempt_at"`
 }
 
+// RetryFailedWikisOptions controls which failed wiki entries are
+// retried. Same shape as RetryFailedImagesOptions so the front-end can
+// reuse the same form widget — only the meaning of "entry" changes
+// (wiki slug vs image url).
+type RetryFailedWikisOptions struct {
+	OnlyErrorClasses []string `json:"only_error_classes,omitempty"`
+	MaxAttempts      int      `json:"max_attempts,omitempty"`
+	DryRun           bool     `json:"dry_run,omitempty"`
+}
+
+// RetryFailedWikisResult is the handler response for POST /knowledge/{id}
+// /retry-failed-wikis. Counts how many slugs were requeued vs filtered
+// out vs total failed.
+type RetryFailedWikisResult struct {
+	KnowledgeID string `json:"knowledge_id"`
+	Requeued    int    `json:"requeued"`
+	Skipped     int    `json:"skipped"`
+	TotalFailed int    `json:"total_failed"`
+}
+
+// WikiStatusReport is one row in the GET /knowledge/{id}/wiki-statuses
+// response. Aggregated from chunks.metadata.wiki_statuses across every
+// text chunk under the knowledge (wiki statuses are written onto the
+// first text chunk in listChunksByKnowledgeID order, so reports may
+// carry the same ParentChunkID for many slugs).
+type WikiStatusReport struct {
+	Slug          string    `json:"slug"`
+	ParentChunkID string    `json:"parent_chunk_id"`
+	Status        string    `json:"status"`
+	ErrorClass    string    `json:"error_class,omitempty"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
+	Attempts      int       `json:"attempts"`
+	LastAttemptAt time.Time `json:"last_attempt_at"`
+}
+
 // CustomMetadataText returns stable human-readable metadata for summaries and
 // document-scoped model context. Internal ingestion metadata is intentionally
 // excluded.

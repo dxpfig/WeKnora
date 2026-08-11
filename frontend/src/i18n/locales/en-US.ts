@@ -794,7 +794,13 @@ export default {
     },
     errorCode: {
       UNKNOWN_SUGGESTION: 'Check the application logs for details.'
-    }
+    },
+    retryThisImage: 'Retry this image',
+    retryThisWiki: 'Retry this wiki',
+    retryFailedImages: 'Retry failed images',
+    retryFailedWikis: 'Retry failed wikis',
+    failedImagesBadge: '{n} failed image(s)',
+    failedWikisBadge: '{n} failed wiki(s)'
   },
   agent: {
     taskLabel: 'Task:',

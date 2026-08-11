@@ -114,6 +114,11 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		// clears. Editor-gated, same level as reparse.
 		k.POST("/:id/retry-failed-images", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.RetryFailedImages)
 		kRead.GET("/:id/image-statuses", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.ListImageStatuses)
+		// Per-wiki retry: re-enqueues failed wiki ingest tasks. Mirrors the
+		// per-image retry surface; only successful when task_pending_ops is
+		// wired (Standard mode). Lite mode returns 501 from the handler.
+		k.POST("/:id/retry-failed-wikis", g.OwnedKnowledgeKBOrAdmin(), g.KBAccessWriteFromKnowledgeIDParam("id"), handler.RetryFailedWikis)
+		kRead.GET("/:id/wiki-statuses", g.Viewer(), g.KBAccessReadFromKnowledgeIDParam("id"), handler.ListWikiStatuses)
 		// Downloading exposes the original source file, so it has a stricter
 		// boundary than viewing parsed content or previewing it: tenant Viewers
 		// cannot download from their own workspace, and org-shared Viewer access

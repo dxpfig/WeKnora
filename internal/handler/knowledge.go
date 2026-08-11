@@ -2108,6 +2108,119 @@ func (h *KnowledgeHandler) RetryFailedImages(c *gin.Context) {
 	})
 }
 
+// ListWikiStatuses godoc
+// @Summary      列出 wiki 状态
+// @Description  聚合展示该知识下每个 wiki slug 的处理状态（失败/成功/重试次数）。
+// @Tags         知识管理
+// @Produce      json
+// @Param        id   path      string  true  "知识ID"
+// @Success      200  {object}  map[string]interface{}
+// @Failure      403  {object}  errors.AppError
+// @Security     Bearer
+// @Router       /knowledge/{id}/wiki-statuses [get]
+func (h *KnowledgeHandler) ListWikiStatuses(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start listing wiki statuses")
+
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		logger.Error(ctx, "Knowledge ID is empty")
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleViewer)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	reports, err := h.kgService.ListWikiStatuses(effCtx, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"knowledge_id": id})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	summary := map[string]int{"total": len(reports), "succeeded": 0, "failed": 0}
+	for _, r := range reports {
+		if r.Status == string(types.WikiStatusFailed) {
+			summary["failed"]++
+		} else if r.Status == string(types.WikiStatusSucceeded) {
+			summary["succeeded"]++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"knowledge_id": id,
+			"wikis":        reports,
+			"summary":      summary,
+		},
+	})
+}
+
+// RetryFailedWikis godoc
+// @Summary      重试失败的 wiki
+// @Description  重新入队失败的 wiki 生成任务。默认仅重试被识别为 rate_limit 的 wiki，跳过尝试次数 >= max_attempts 的。
+// @Tags         知识管理
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "知识ID"
+// @Param        body body      types.RetryFailedWikisOptions  false  "过滤选项"
+// @Success      200  {object}  map[string]interface{}
+// @Failure      403  {object}  errors.AppError
+// @Security     Bearer
+// @Router       /knowledge/{id}/retry-failed-wikis [post]
+func (h *KnowledgeHandler) RetryFailedWikis(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start retrying failed wikis")
+
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		logger.Error(ctx, "Knowledge ID is empty")
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	var opts types.RetryFailedWikisOptions
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&opts); err != nil {
+			logger.Error(ctx, "Failed to parse wiki retry request body", err)
+			c.Error(errors.NewBadRequestError("Invalid wiki retry request body").WithDetails(err.Error()))
+			return
+		}
+	}
+
+	result, err := h.kgService.RetryFailedWikis(effCtx, id, opts)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"knowledge_id": id})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	logger.Infof(ctx,
+		"Wiki retry result: knowledge=%s requeued=%d skipped=%d total_failed=%d",
+		secutils.SanitizeForLog(id), result.Requeued, result.Skipped, result.TotalFailed)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Wiki retry tasks submitted",
+		"data":    result,
+	})
+}
+
 // CancelKnowledgeParse godoc
 // @Summary      取消知识解析
 // @Description  取消进行中的知识解析任务。当前已写入的 chunk / 索引保留，可通过 reparse 接口重新触发解析。已完成 / 已失败 / 删除中的知识不支持取消。

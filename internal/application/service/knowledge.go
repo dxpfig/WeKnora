@@ -1267,3 +1267,173 @@ func (s *knowledgeService) RetryFailedImages(
 	}
 	return result, nil
 }
+
+// shouldRetryWiki mirrors shouldRetryImage for the wiki failure
+// surface. Same OnlyErrorClasses / MaxAttempts semantics so the front
+// end can reuse the same form widget.
+func shouldRetryWiki(
+	slug string, entry types.WikiStatusEntry, opts types.RetryFailedWikisOptions,
+) (shouldRetry bool, reason string) {
+	_ = slug
+
+	if entry.Status != types.WikiStatusFailed {
+		return false, fmt.Sprintf("not in failed state (current: %s)", entry.Status)
+	}
+	if len(opts.OnlyErrorClasses) > 0 && !slices.Contains(opts.OnlyErrorClasses, entry.ErrorClass) {
+		return false, fmt.Sprintf("not a retriable error type (class=%s not in filter)", entry.ErrorClass)
+	}
+	if opts.MaxAttempts > 0 && entry.Attempts >= opts.MaxAttempts {
+		return false, fmt.Sprintf("reached max attempts (attempts=%d, max=%d)", entry.Attempts, opts.MaxAttempts)
+	}
+	return true, ""
+}
+
+// ListWikiStatuses aggregates every wiki_statuses entry across all
+// text chunks under this knowledge. Same aggregation pattern as
+// ListImageStatuses, scoped to wiki_statuses.
+func (s *knowledgeService) ListWikiStatuses(
+	ctx context.Context, knowledgeID string,
+) ([]types.WikiStatusReport, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	chunks, err := s.chunkRepo.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return nil, fmt.Errorf("list chunks by knowledge: %w", err)
+	}
+	var reports []types.WikiStatusReport
+	for _, c := range chunks {
+		if len(c.Metadata) == 0 {
+			continue
+		}
+		var meta struct {
+			WikiStatuses types.WikiStatuses `json:"wiki_statuses"`
+		}
+		if err := json.Unmarshal(c.Metadata, &meta); err != nil {
+			continue
+		}
+		for slug, entry := range meta.WikiStatuses {
+			reports = append(reports, types.WikiStatusReport{
+				Slug:          slug,
+				ParentChunkID: c.ID,
+				Status:        string(entry.Status),
+				ErrorClass:    entry.ErrorClass,
+				ErrorMessage:  entry.ErrorMessage,
+				Attempts:      entry.Attempts,
+				LastAttemptAt: entry.LastAttemptAt,
+			})
+		}
+	}
+	return reports, nil
+}
+
+// RetryFailedWikis re-runs the wiki ingest pipeline for every doc that
+// has at least one failed wiki_statuses entry. Strategy: insert a fresh
+// task_pending_ops row for the knowledge_id (enqueueWikiIngestTrigger
+// will pick it up on its next pass), and the wiki pipeline's normal
+// extract/summary/classify run will overwrite the failed entry on
+// success. Defaults (zero-value opts): only retry rate_limit
+// failures, no cap on attempts — mirrors RetryFailedImages.
+func (s *knowledgeService) RetryFailedWikis(
+	ctx context.Context, knowledgeID string, opts types.RetryFailedWikisOptions,
+) (types.RetryFailedWikisResult, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	result := types.RetryFailedWikisResult{KnowledgeID: knowledgeID}
+
+	chunks, err := s.chunkRepo.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+	if err != nil {
+		return result, fmt.Errorf("list chunks by knowledge: %w", err)
+	}
+
+	// Collect (slug, parentChunkID, entry) for every failed wiki status.
+	type cand struct {
+		slug          string
+		parentChunkID string
+		entry         types.WikiStatusEntry
+	}
+	var candidates []cand
+	for _, c := range chunks {
+		if len(c.Metadata) == 0 {
+			continue
+		}
+		var meta struct {
+			WikiStatuses types.WikiStatuses `json:"wiki_statuses"`
+		}
+		if err := json.Unmarshal(c.Metadata, &meta); err != nil {
+			continue
+		}
+		for slug, entry := range meta.WikiStatuses {
+			if entry.Status == types.WikiStatusFailed {
+				candidates = append(candidates, cand{slug, c.ID, entry})
+				result.TotalFailed++
+			}
+		}
+	}
+
+	// Dedup by parentChunkID — one wiki ingest run covers the whole doc,
+	// so multiple failed slugs under the same chunk need only one re-enqueue.
+	requeuedDocs := make(map[string]bool)
+	for _, k := range candidates {
+		retry, why := shouldRetryWiki(k.slug, k.entry, opts)
+		if !retry {
+			result.Skipped++
+			logger.Infof(ctx,
+				"[RetryFailedWikis] skip slug=%s reason=%s",
+				k.slug, why)
+			continue
+		}
+		if opts.DryRun {
+			result.Requeued++
+			continue
+		}
+		if requeuedDocs[k.parentChunkID] {
+			// Already scheduled the ingest for this doc's first chunk;
+			// other failed slugs under it will be covered by the same run.
+			result.Requeued++
+			continue
+		}
+		// Resolve the KB id from the parent chunk (wiki_statuses is
+		// keyed by the first text chunk — its KB is the wiki target).
+		parent, err := s.chunkRepo.GetChunkByID(ctx, tenantID, k.parentChunkID)
+		if err != nil || parent == nil {
+			logger.Errorf(ctx,
+				"[RetryFailedWikis] parent chunk lookup failed %s: %v",
+				k.parentChunkID, err)
+			result.Skipped++
+			continue
+		}
+		if s.taskPendingRepo == nil {
+			logger.Errorf(ctx,
+				"[RetryFailedWikis] task_pending_ops repo not wired; cannot enqueue doc %s",
+				knowledgeID)
+			result.Skipped++
+			continue
+		}
+		op, err := newWikiIngestPendingOp(ctx, tenantID, parent.KnowledgeBaseID, knowledgeID)
+		if err != nil {
+			logger.Errorf(ctx,
+				"[RetryFailedWikis] build pending op failed kid=%s: %v",
+				knowledgeID, err)
+			result.Skipped++
+			continue
+		}
+		if err := s.taskPendingRepo.Enqueue(ctx, op); err != nil {
+			logger.Errorf(ctx,
+				"[RetryFailedWikis] enqueue pending op failed kid=%s: %v",
+				knowledgeID, err)
+			result.Skipped++
+			continue
+		}
+		if err := enqueueWikiIngestTrigger(ctx, s.task, tenantID, parent.KnowledgeBaseID); err != nil {
+			logger.Errorf(ctx,
+				"[RetryFailedWikis] enqueue trigger failed kb=%s: %v",
+				parent.KnowledgeBaseID, err)
+			result.Skipped++
+			continue
+		}
+		requeuedDocs[k.parentChunkID] = true
+		result.Requeued++
+		logger.Infof(ctx,
+			"[RetryFailedWikis] requeued kid=%s slug=%s",
+			knowledgeID, k.slug)
+	}
+	return result, nil
+}

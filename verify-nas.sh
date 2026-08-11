@@ -25,9 +25,10 @@ ssh "${NAS_HOST}" "cd ${NAS_DIR} && docker compose -f docker-compose.nas.yml --p
 
 echo ""
 echo "===== [2/7] app health ====="
-HEALTH=$(curl -sf http://192.168.2.3:8080/health || echo "FAIL")
-echo "    /health -> ${HEALTH}"
-[[ "${HEALTH}" != "ok" ]] && { echo "❌ health 失败"; exit 1; }
+HEALTH_JSON=$(curl -sf http://192.168.2.3:8080/health || echo "FAIL")
+HEALTH_STATUS=$(echo "${HEALTH_JSON}" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+echo "    /health -> ${HEALTH_JSON}  (status: ${HEALTH_STATUS})"
+[[ "${HEALTH_STATUS}" != "ok" ]] && { echo "[X] health 失败"; exit 1; }
 
 echo ""
 echo "===== [3/7] app 镜像 ID（应与本机 build 的一致） ====="
@@ -59,6 +60,16 @@ if [[ "${GET_STATUS}" == "404" || "${POST_STATUS}" == "404" ]]; then
   exit 1
 fi
 
+# Wiki retry endpoints (mirrors the image pair).
+WIKI_GET_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://192.168.2.3:8080/api/v1/knowledge/test/wiki-statuses" || echo "ERR")
+WIKI_POST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://192.168.2.3:8080/api/v1/knowledge/test/retry-failed-wikis" || echo "ERR")
+echo "    GET  /knowledge/test/wiki-statuses         -> ${WIKI_GET_STATUS} (期望 401 / 400,不要 404)"
+echo "    POST /knowledge/test/retry-failed-wikis    -> ${WIKI_POST_STATUS} (期望 401 / 400,不要 404)"
+if [[ "${WIKI_GET_STATUS}" == "404" || "${WIKI_POST_STATUS}" == "404" ]]; then
+  echo "❌ Wiki retry endpoint 没注册 — 路由没刷上。需要 force-recreate。"
+  exit 1
+fi
+
 echo ""
 echo "===== [7/7] 迁移 000005 已应用(idx_chunks_metadata_gin) ====="
 # 检查 GIN 索引是否存在。索引不在的话 '@>' 查询会全表扫。
@@ -78,10 +89,14 @@ echo "    检查两个字符串是否在二进制里："
 ssh "${NAS_HOST}" "docker exec weknora-app sh -c '
   A=\$(strings /app/WeKnora 2>/dev/null | grep -c \"MinGW 16 emutls\" || echo 0);
   B=\$(strings /app/WeKnora 2>/dev/null | grep -c \"recordImageStatus: parent chunk\" || echo 0);
+  C=\$(strings /app/WeKnora 2>/dev/null | grep -c \"recordWikiStatus\" || echo 0);
+  D=\$(strings /app/WeKnora 2>/dev/null | grep -c \"RetryFailedWikis\" || echo 0);
   echo \"MinGW 16 emutls                : \$A\";
-  echo \"recordImageStatus: parent chunk: \$B\"'" \
+  echo \"recordImageStatus: parent chunk: \$B\";
+  echo \"recordWikiStatus (wiki metadata write helper) : \$C\";
+  echo \"RetryFailedWikis (service entrypoint)         : \$D\"'" \
   | sed 's/^/      /'
-echo "    （两个都 >0 表示你刚 commit 的代码确实在跑的二进制里）"
+echo "    （四个都 >0 表示你刚 commit 的代码确实在跑的二进制里）"
 
 echo ""
 echo "===== 完成 ====="

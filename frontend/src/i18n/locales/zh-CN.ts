@@ -5150,6 +5150,12 @@ export default {
     errorCode: {
       UNKNOWN_SUGGESTION: '请查看应用日志获取详细信息。'
     },
+    retryThisImage: '重试该图片',
+    retryThisWiki: '重试该 wiki',
+    retryFailedImages: '重试失败的图片',
+    retryFailedWikis: '重试失败的 wiki',
+    failedImagesBadge: '{n} 张图片失败',
+    failedWikisBadge: '{n} 个 wiki 失败',
     status: {
       pending: '等待中',
       running: '进行中',

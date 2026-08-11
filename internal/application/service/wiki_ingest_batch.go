@@ -1425,6 +1425,17 @@ func (s *wikiIngestService) mapOneDocument(
 		// the LLM's own transient-error budget before we give up here.
 		logger.Errorf(ctx, "wiki ingest: generate summary failed for %s, will requeue: %v", knowledgeID, summaryErr)
 		s.tracker().FailSpan(ctx, wikiSpan, "SUMMARY_FAILED", summaryErr.Error(), summaryErr)
+		// Best-effort: persist the failure on the knowledge's first
+		// text chunk so retry-failed-wikis can find it without scanning
+		// task_pending_ops. op.dbID is the pending-op row id when this
+		// doc was dispatched via task_pending_ops; 0 in legacy paths.
+		s.recordWikiOutcome(ctx, payload.TenantID, knowledgeID, summarySlug, op.dbID, types.WikiStatusEntry{
+			Status:        types.WikiStatusFailed,
+			ErrorClass:    classifyLLMError(summaryErr),
+			ErrorMessage:  truncateString(summaryErr.Error(), 256),
+			LastAttemptAt: time.Now(),
+			Attempts:      1,
+		})
 		return nil, nil, fmt.Errorf("generate summary: %w", summaryErr)
 	}
 	sumLine, sumBody := splitSummaryLine(summaryContent)
@@ -2144,4 +2155,19 @@ func mergeChunkRefs(current types.StringArray, additions []SlugUpdate) types.Str
 		}
 	}
 	return out
+}
+
+// classifyLLMError buckets an LLM-call error into the same ErrorClass
+// vocabulary used by image Status entries ("rate_limit" | "vlm_error"
+// | "other") so the retry UI can group failures consistently across
+// image and wiki. Returns "other" when the error is nil so callers
+// don't have to nil-check at every call site.
+func classifyLLMError(err error) string {
+	if err == nil {
+		return "other"
+	}
+	if ratelimit.IsLikelyRateLimitError(err) {
+		return "rate_limit"
+	}
+	return "vlm_error"
 }

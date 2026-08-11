@@ -211,6 +211,41 @@ type ImageStatusEntry struct {
 // keyed by the provider:// image URL used as the asynq task identity.
 type ImageStatuses map[string]ImageStatusEntry
 
+// WikiStatus records the per-wiki-page processing outcome for a parent
+// text chunk. Lives under chunks.metadata["wiki_statuses"][wiki_page_id]
+// (JSONB) for the text chunk that seeds the wiki page generation.
+//
+// Mirrors the image_statuses design — status is per-wiki-page, persisted
+// inside the parent chunk's metadata, no new table needed. The wiki_ingest
+// failure path writes here so retry-failed-wikis can find the failed entries.
+type WikiStatus string
+
+const (
+	// WikiStatusSucceeded means the wiki page extract + summary +
+	// classify all completed and a wiki_page chunk was written.
+	WikiStatusSucceeded WikiStatus = "succeeded"
+	// WikiStatusFailed means one of the wiki pipeline stages errored
+	// and no usable wiki_page chunk was produced. ErrorClass
+	// disambiguates the cause (same vocabulary as ImageStatusEntry:
+	// "rate_limit" | "vlm_error" | "other").
+	WikiStatusFailed WikiStatus = "failed"
+)
+
+// WikiStatusEntry is the value stored at wiki_statuses[wiki_page_id].
+// Persisted as JSON inside chunks.metadata, so all fields use JSON tags
+// and omit-empty values keep the column lean.
+type WikiStatusEntry struct {
+	Status        WikiStatus `json:"status"`
+	ErrorClass    string     `json:"error_class,omitempty"`   // "rate_limit" | "vlm_error" | "other"
+	ErrorMessage  string     `json:"error_message,omitempty"` // last error text, truncated by caller
+	LastAttemptAt time.Time  `json:"last_attempt_at"`
+	Attempts      int        `json:"attempts"`
+}
+
+// WikiStatuses is the map persisted under chunks.metadata["wiki_statuses"],
+// keyed by wiki_page_id (the deterministic id assigned during extract).
+type WikiStatuses map[string]WikiStatusEntry
+
 // ChunkRevision is an immutable snapshot of a superseded chunk revision.
 // The current content lives on Chunk; this table stores prior versions.
 type ChunkRevision struct {

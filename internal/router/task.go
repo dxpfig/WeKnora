@@ -17,6 +17,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils/ratelimit"
 	"github.com/hibiken/asynq"
 	"go.uber.org/dig"
 )
@@ -116,11 +117,54 @@ const wikiIngestRetryDelay = 15 * time.Second
 // this override, a crash-restart cycle can leave a KB unable to make
 // progress for 7–10 minutes while the orphan lock expires AND the retry
 // schedule catches up.
+//
+// For retryable failures on the per-image / per-wiki surfaces
+// (TypeImageMultimodal + TypeWikiIngest), use exponential-with-jitter
+// backoff so a sustained provider rate-limit clears before we burn
+// through the 3-retry budget. The jitter is critical — without it a
+// fleet of retried tasks synchronously hammer the provider the moment
+// the rate-limit window expires.
 func asynqRetryDelayFunc(n int, e error, t *asynq.Task) time.Duration {
 	if errors.Is(e, service.ErrWikiIngestConcurrent) {
 		return wikiIngestRetryDelay
 	}
+	if t != nil {
+		switch t.Type() {
+		case types.TypeImageMultimodal, types.TypeWikiIngest:
+			return rateLimitAwareRetryDelay(n, e)
+		}
+	}
 	return asynq.DefaultRetryDelayFunc(n, e, t)
+}
+
+// rateLimitAwareRetryDelay applies the same backoff recipe to image
+// multimodal and wiki ingest retries:
+//   base = min(2^(n-1), 60) seconds
+//   jitter = uniform(0, 1) second
+//   if e is a rate-limit error: base doubles (and re-clamps to 60s)
+// Bounded by retryLimit attempts at the call site (asynq MaxRetry(3)
+// on the image retry path, MaxRetry(wikiIngestMaxRetry) on wiki). Caller
+// is expected to clamp `n` to a sane value; we don't panic on garbage.
+func rateLimitAwareRetryDelay(n int, e error) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	// 2^(n-1) seconds, capped at 60s.
+	exp := time.Duration(1) << uint(min(n-1, 6)) // shift up to 2^6 = 64s
+	if exp > 60*time.Second {
+		exp = 60 * time.Second
+	}
+	if e != nil && ratelimit.IsLikelyRateLimitError(e) {
+		exp *= 2
+		if exp > 60*time.Second {
+			exp = 60 * time.Second
+		}
+	}
+	// Jitter: 0–1 second, source: time-based pseudo-random so we
+	// don't need to seed math/rand at init. nano-second clock is
+	// plenty for spreading a fleet of retries.
+	jitter := time.Duration(time.Now().UnixNano()%1000) * time.Millisecond
+	return exp + jitter
 }
 
 // Worker defaults live in types so server construction and runtime reporting

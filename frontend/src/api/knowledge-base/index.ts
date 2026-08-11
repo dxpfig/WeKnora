@@ -365,6 +365,73 @@ export function getKnowledgeSpans(id: string, attempt?: number) {
   return get(`/api/v1/knowledge/${id}/spans${qs}`);
 }
 
+// Per-image retry surface: see POST /knowledge/{id}/retry-failed-images
+// and GET /knowledge/{id}/image-statuses. Returns shape mirrors the
+// image_statuses JSONB field on chunks.metadata.
+export interface RetryFailedImagesOptions {
+  only_error_classes?: string[];
+  max_attempts?: number;
+  dry_run?: boolean;
+}
+export interface RetryFailedImagesResult {
+  knowledge_id: string;
+  requeued: number;
+  skipped: number;
+  total_failed: number;
+}
+export interface ImageStatusReport {
+  image_url: string;
+  parent_chunk_id: string;
+  status: 'succeeded' | 'failed';
+  error_class?: string;
+  error_message?: string;
+  attempts: number;
+  last_attempt_at: string;
+}
+export function listImageStatuses(id: string) {
+  return get<{
+    knowledge_id: string;
+    images: ImageStatusReport[];
+    summary: { total: number; succeeded: number; failed: number };
+  }>(`/api/v1/knowledge/${id}/image-statuses`);
+}
+export function retryFailedImages(id: string, opts?: RetryFailedImagesOptions) {
+  return post<RetryFailedImagesResult>(`/api/v1/knowledge/${id}/retry-failed-images`, opts);
+}
+
+// Per-wiki retry surface: see POST /knowledge/{id}/retry-failed-wikis
+// and GET /knowledge/{id}/wiki-statuses.
+export interface RetryFailedWikisOptions {
+  only_error_classes?: string[];
+  max_attempts?: number;
+  dry_run?: boolean;
+}
+export interface RetryFailedWikisResult {
+  knowledge_id: string;
+  requeued: number;
+  skipped: number;
+  total_failed: number;
+}
+export interface WikiStatusReport {
+  slug: string;
+  parent_chunk_id: string;
+  status: 'succeeded' | 'failed';
+  error_class?: string;
+  error_message?: string;
+  attempts: number;
+  last_attempt_at: string;
+}
+export function listWikiStatuses(id: string) {
+  return get<{
+    knowledge_id: string;
+    wikis: WikiStatusReport[];
+    summary: { total: number; succeeded: number; failed: number };
+  }>(`/api/v1/knowledge/${id}/wiki-statuses`);
+}
+export function retryFailedWikis(id: string, opts?: RetryFailedWikisOptions) {
+  return post<RetryFailedWikisResult>(`/api/v1/knowledge/${id}/retry-failed-wikis`, opts);
+}
+
 export function delKnowledgeDetails(id: string) {
   return del(`/api/v1/knowledge/${id}`);
 }

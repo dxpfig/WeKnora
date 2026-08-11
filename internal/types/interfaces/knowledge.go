@@ -151,6 +151,21 @@ type KnowledgeService interface {
 		knowledgeID string,
 		opts types.RetryFailedImagesOptions,
 	) (types.RetryFailedImagesResult, error)
+	// ListWikiStatuses returns per-wiki-slug processing status for every
+	// wiki entry attached to the first text chunk in this knowledge.
+	// Aggregated from chunks.metadata.wiki_statuses (JSONB). Mirrors
+	// ListImageStatuses but for the wiki pipeline.
+	ListWikiStatuses(ctx context.Context, knowledgeID string) ([]types.WikiStatusReport, error)
+	// RetryFailedWikis re-enqueues wiki ingest tasks for slugs whose
+	// wiki_statuses entry is failed. Default behavior (zero-value opts):
+	// only retry rate_limit failures, no cap on attempts. Mirrors
+	// RetryFailedImages but re-runs the wiki extract/summary/classify
+	// pipeline instead of TypeImageMultimodal.
+	RetryFailedWikis(
+		ctx context.Context,
+		knowledgeID string,
+		opts types.RetryFailedWikisOptions,
+	) (types.RetryFailedWikisResult, error)
 	// CloneKnowledgeBase clones knowledge to another knowledge base.
 	CloneKnowledgeBase(ctx context.Context, srcID, dstID string) error
 	// UpdateImageInfo updates image information for a knowledge chunk.

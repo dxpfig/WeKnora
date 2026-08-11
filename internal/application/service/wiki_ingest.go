@@ -3077,6 +3077,87 @@ func cleanLLMJSON(s string) string {
 
 // sanitizeJSONString sanitizes a string that is intended to be parsed as JSON,
 // by properly escaping unescaped control characters (like newlines) inside string literals.
+// recordWikiOutcome writes the final wiki_statuses[slug] entry on the
+// first text chunk under the failed knowledge. Mirrors the image
+// Status pattern (recordImageOutcome) so retry-failed-wikis can find
+// the failed entries through the same GIN index.
+//
+// dbID is the task_pending_ops.id; we use IncrFailCount to bump the
+// authoritative attempt counter and seed WikiStatusEntry.Attempts.
+// Pass 0 for dbID when no pending-op row exists (e.g. legacy paths).
+//
+// Best-effort: never returns an error. Status tracking must not fail
+// the actual wiki pipeline. Failures here only log a warning.
+func (s *wikiIngestService) recordWikiOutcome(
+	ctx context.Context, tenantID uint64, knowledgeID, slug string,
+	dbID int64, entry types.WikiStatusEntry,
+) {
+	if s.pendingRepo != nil && dbID > 0 {
+		if count, err := s.pendingRepo.IncrFailCount(ctx, dbID); err != nil {
+			logger.Warnf(ctx,
+				"[WikiIngest] recordWikiStatus: incr fail_count for dbID=%d: %v",
+				dbID, err)
+		} else if count > 0 {
+			entry.Attempts = count
+		}
+	}
+	s.updateWikiStatusEntry(ctx, tenantID, knowledgeID, slug, func(e *types.WikiStatusEntry) {
+		e.Status = entry.Status
+		e.ErrorClass = entry.ErrorClass
+		e.ErrorMessage = entry.ErrorMessage
+		e.LastAttemptAt = entry.LastAttemptAt
+		if entry.Attempts > e.Attempts {
+			e.Attempts = entry.Attempts
+		}
+	})
+}
+
+// updateWikiStatusEntry is the shared read-modify-write helper for
+// recordWikiOutcome. Targets the first text chunk under the knowledge
+// (ListChunksByKnowledgeID returns them in chunk_index order, so the
+// first one is the canonical "anchor"). Silent on failure.
+func (s *wikiIngestService) updateWikiStatusEntry(
+	ctx context.Context, tenantID uint64, knowledgeID, slug string,
+	mutate func(*types.WikiStatusEntry),
+) {
+	chunks, err := s.chunkRepo.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+	if err != nil || len(chunks) == 0 {
+		logger.Warnf(ctx,
+			"[WikiIngest] recordWikiStatus: no chunks for knowledge %s: %v",
+			knowledgeID, err)
+		return
+	}
+	parent := chunks[0]
+	var meta struct {
+		WikiStatuses types.WikiStatuses `json:"wiki_statuses"`
+	}
+	if len(parent.Metadata) > 0 {
+		if err := json.Unmarshal(parent.Metadata, &meta); err != nil {
+			logger.Warnf(ctx,
+				"[WikiIngest] recordWikiStatus: unmarshal metadata: %v", err)
+		}
+	}
+	if meta.WikiStatuses == nil {
+		meta.WikiStatuses = types.WikiStatuses{}
+	}
+	entry := meta.WikiStatuses[slug]
+	mutate(&entry)
+	meta.WikiStatuses[slug] = entry
+
+	marshalled, err := json.Marshal(meta)
+	if err != nil {
+		logger.Warnf(ctx,
+			"[WikiIngest] recordWikiStatus: marshal metadata: %v", err)
+		return
+	}
+	parent.Metadata = marshalled
+	if err := s.chunkRepo.UpdateChunk(ctx, parent); err != nil {
+		logger.Warnf(ctx,
+			"[WikiIngest] recordWikiStatus: update chunk %s: %v",
+			parent.ID, err)
+	}
+}
+
 func sanitizeJSONString(s string) string {
 	var buf strings.Builder
 	buf.Grow(len(s))
